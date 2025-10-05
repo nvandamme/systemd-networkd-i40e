@@ -1,4 +1,4 @@
-# i40e / X710 SR-IOV Post-link Helper — Service + Script
+# i40e / X710 SR-IOV Post-link SystemD Service
 
 This packages a post-link helper script and a systemd service for Intel X710 (i40e/iavf). It applies PF/VF tunables right after link/VF creation, supports derived VF MACs, and implements the i40e VM pass-through quirk.
 
