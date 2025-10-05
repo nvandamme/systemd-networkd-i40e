@@ -1,0 +1,14 @@
+[Unit]
+Description=Intel X710 post-link tweaks for %I
+After=systemd-udevd.service
+Wants=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/i40e-postlink %I
+TimeoutStartSec=30s
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

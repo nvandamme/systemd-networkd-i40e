@@ -1,0 +1,20 @@
+[Match]
+OriginalName=enp2s0f1np1
+
+[Link]
+UseAdaptiveRxCoalesce=no
+UseAdaptiveTxCoalesce=no
+RxCoalesceSec=0
+TxCoalesceSec=0
+
+Property=I40E_DISABLE_FW_LLDP=1
+Property=I40E_ENABLE_VF_TRUE_PROMISC=1
+Property=I40E_VM_QUIRK=1
+
+Property=I40E_PF_OFFLOAD=rxvlan off
+Property=I40E_PF_RINGS=rx 4096 tx 4096
+Property=I40E_PF_CHANNELS=combined 16
+
+Property=I40E_VF0_OFFLOAD=rxvlan off gro off
+Property=I40E_VF0_RINGS=rx 4096 tx 4096
+Property=I40E_VF0_QUIRK=1

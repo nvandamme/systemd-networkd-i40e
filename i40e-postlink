@@ -1,0 +1,351 @@
+#!/bin/sh
+# i40e/X710 post-link helper (PF-level) for SR-IOV + VM/LXC pass-through
+# - Reads custom I40E_* properties from systemd .link (via udevadm info)
+# - Applies ALL ethtool tunables first (PF, then VF), then ALL ip(8) tunables
+# - Derives contiguous VF MACs from PF MAC (LAA+unicast safe), unless an admin MAC exists
+# - VM_QUIRK: enforce rxvlan off on PF+VF (ethtool) then bounce VF port-VLAN 10 -> 0 (ip)
+# - Enables useful priv-flags (disable-fw-lldp on by default; vf-true-promisc-support if supported)
+# - Logs INFO on success, WARNING on failure (logger -p kern.*)
+# POSIX /bin/sh compatible (no bashisms)
+
+set -u
+
+# -------------------- logging ------------------------------------------------
+log_info() {
+  if command -v logger >/dev/null 2>&1; then
+    logger -t i40e-postlink -p kern.info -- "$*"
+  else
+    printf 'i40e-postlink[info]: %s\n' "$*" >&2
+  fi
+}
+log_warn() {
+  if command -v logger >/dev/null 2>&1; then
+    logger -t i40e-postlink -p kern.warning -- "$*"
+  else
+    printf 'i40e-postlink[warn]: %s\n' "$*" >&2
+  fi
+}
+
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then log_warn "unexpected non-zero exit rc=$rc"; fi; exit "$rc"' EXIT
+
+# Mutating command wrapper: always log, never abort
+run_apply() {
+  out="$("$@" 2>&1)"; rc=$?
+  if [ $rc -eq 0 ]; then
+    log_info "applied: $*"
+  else
+    log_warn "cmd failed (rc=$rc): $* :: $out"
+  fi
+  return 0
+}
+
+# -------------------- argv / defaults ---------------------------------------
+IF="${1:-}"
+[ -n "$IF" ] || { echo "usage: $0 <pf-ifname>" >&2; exit 2; }
+
+# Defaults (can be overridden by .link props; comments mirror README)
+DERIVE_VF_MACS=${DERIVE_VF_MACS:-1}          # derive VF MACs from PF MAC + VF index, default on
+SKIP_IF_VF_MAC_SET=${SKIP_IF_VF_MAC_SET:-1}  # skip setting derived MAC if admin MAC already set, default on
+ENABLE_VF_TRUE_PROMISC=${ENABLE_VF_TRUE_PROMISC:-1} # full promisc for VFs (ensures allmulticast works), default on
+QUIRK_VLAN_BOUNCE=${QUIRK_VLAN_BOUNCE:-1}    # workaround VLAN tag stripping bug, default on
+DISABLE_FW_LLDP=${DISABLE_FW_LLDP:-1}        # disable Intel FW LLDP agent, default on
+
+# -------------------- helpers ------------------------------------------------
+is_hex_mac() {
+  case "$1" in
+    [0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]) ;;
+    *) return 1 ;;
+  esac
+  mac_nocolon="$(printf %s "$1" | tr -d :)"
+  case "$mac_nocolon" in 000000000000|ffffffffffff|FFFFFFFFFFFF) return 1;; esac
+  first_octet_hex="${1%%:*}"; first_octet=$((16#$first_octet_hex))
+  [ $((first_octet & 1)) -eq 0 ] || return 1  # reject multicast
+  return 0
+}
+
+pf_func_id() {
+  devpath="$(readlink -f "/sys/class/net/$IF/device" 2>/dev/null || true)"
+  [ -n "$devpath" ] || { echo 0; return; }
+  func="${devpath##*.}"
+  printf '%s\n' "$func"
+}
+
+sanitize_llaa_unicast() {
+  # set LAA bit, clear multicast bit
+  printf '%s\n' "$1" | awk -F: '
+    function H(n){return sprintf("%02x",n)}
+    { for(i=1;i<=6;i++){o[i]=strtonum("0x"$i)}
+      o[1]=and(or(o[1],2),254)
+      printf "%s:%s:%s:%s:%s:%s\n",H(o[1]),H(o[2]),H(o[3]),H(o[4]),H(o[5]),H(o[6])
+    }'
+}
+
+derive_mac_prefix() {
+  pfmac="$(cat "/sys/class/net/$IF/address" 2>/dev/null || echo 00:00:00:00:00:00)"
+  pfunc="$(pf_func_id)"
+  printf '%s\n' "$pfmac" | awk -v pfunc="$pfunc" -F: '
+    function H(n){return sprintf("%02x",n)}
+    { for(i=1;i<=6;i++){o[i]=strtonum("0x"$i)}
+      o[1]=and(or(o[1],2),254)
+      o[5]=or(and(o[5],240),and(pfunc,15))
+      printf "%s:%s:%s:%s:%s:",H(o[1]),H(o[2]),H(o[3]),H(o[4]),H(o[5])
+    }'
+}
+
+vf_if_candidates() {
+  # candidate VF netdev names for VF index $1
+  printf '%sv%s\n' "$IF" "$1"
+  printf '%sv%s\n' "${IF%np*}" "$1"
+}
+
+get_vf_admin_mac() {
+  ip -d link show "$IF" 2>/dev/null | awk -v vidx="$1" '
+    $1=="vf" && $2==vidx":" {
+      for(i=1;i<=NF-1;i++) if($i=="MAC"){print $(i+1); exit}
+    }'
+}
+
+ensure_rxvlan_off() {
+  dev="$1"; [ -n "$dev" ] || return 0
+  apply_ethtool_tunables "$dev" K rxvlan off
+}
+
+# -------------------- generic applicators -----------------------------------
+# apply_ethtool_tunables <dev> <FAM|--long|-K|rss> [args...]
+# fam can be: K/offload/features, C/coalesce, A/pause, G/ring, L/channels, X/rxfh/rss, N/ntuple/configntuple
+apply_ethtool_tunables() {
+  dev="${1:-}"; fam_in="${2:-}"; shift 2
+  [ -n "$dev" ] && [ -n "$fam_in" ] || return 0
+
+  fam_norm=$(printf %s "$fam_in" | tr -d '-' | tr '[:upper:]' '[:lower:]')
+  case "$fam_norm" in
+    k|offload|features)          short='-K' ;;
+    c|coalesce)                  short='-C' ;;
+    a|pause)                     short='-A' ;;
+    g|ring)                      short='-G' ;;
+    l|channels|channel)          short='-L' ;;
+    x|rxfh|rss)                  short='-X' ;;
+    n|ntuple|configntuple)       short='-N' ;;
+    *) log_warn "unknown ethtool family '$fam_in' for $dev"; return 0 ;;
+  esac
+
+  # If first arg also looks like a family token, drop it once.
+  if [ $# -gt 0 ]; then
+    first_norm=$(printf %s "${1}" | tr -d '-' | tr '[:upper:]' '[:lower:]')
+    case "$first_norm" in
+      k|offload|features|c|coalesce|a|pause|g|ring|l|channels|channel|x|rxfh|rss|n|ntuple|configntuple)
+        shift
+        ;;
+    esac
+  fi
+
+  [ $# -gt 0 ] || return 0
+
+  case "$short" in
+    -K) run_apply ethtool -K "$dev" "$@" ;;
+    -C) run_apply ethtool -C "$dev" "$@" ;;
+    -A) run_apply ethtool -A "$dev" "$@" ;;
+    -G) run_apply ethtool -G "$dev" "$@" ;;
+    -L) run_apply ethtool -L "$dev" "$@" ;;
+    -X) run_apply ethtool -X "$dev" "$@" ;;
+    -N) run_apply ethtool -N "$dev" "$@" ;;
+  esac
+}
+
+# apply_ip_tunables <dev> [<vf_idx>] <subcmd...>
+# If the second token is numeric → VF path; otherwise PF path.
+apply_ip_tunables() {
+  dev="${1:-}"
+  vf="${2:-}"
+  shift 2
+  [ -n "$dev" ] || return 0
+
+  sub="$*"
+
+  if [ -z "$vf" ] then
+    [ -n "$sub" ] || return 0
+    set -- $sub
+    run_apply ip link set dev "$dev" "$@"
+    return 0
+  fi
+
+  case "$vf" in
+    *[!0-9]*)
+      if [ -n "$sub" ]; then
+        set -- "$vf" $sub
+      else
+        set -- "$vf"
+      fi
+      run_apply ip link set dev "$dev" "$@"
+      ;;
+    *)
+      [ -n "$sub" ] || return 0
+      set -- $sub
+      run_apply ip link set dev "$dev" vf "$vf" "$@"
+      ;;
+  esac
+}
+
+# -------------------- read I40E_* properties from .link ----------------------
+# Populates LINK_I40E_* shell vars.
+load_link_props() {
+  ifname="$1"
+  props="$(udevadm info -q property -p "/sys/class/net/$ifname" 2>/dev/null || true)"
+  oldifs=$IFS
+  IFS='
+'
+  for line in $props; do
+    case "$line" in
+      I40E_*=*)
+        key="${line%%=*}"
+        val="${line#*=}"
+        case "$val" in
+          \"*\") val=${val#\"}; val=${val%\"} ;;
+        esac
+        esc=$(printf '%s' "$val" | sed 's/\\\\/\\\\\\\\/g; s/"/\\"/g')
+        eval "LINK_${key}=\"$esc\""
+        ;;
+    esac
+  done
+  IFS=$oldifs
+}
+
+# ----------------- apply from properties ------------------------------------
+apply_from_props_pf() {
+  if [ -n "${LINK_I40E_PRIVFLAGS:-}" ]; then
+    set -- $LINK_I40E_PRIVFLAGS
+    while [ $# -ge 2 ]; do
+      run_apply ethtool --set-priv-flags "$IF" "$1" "$2"
+      shift 2
+    done
+  fi
+
+  [ -n "${LINK_I40E_PF_OFFLOAD:-}"  ] && apply_ethtool_tunables "$IF" K         $LINK_I40E_PF_OFFLOAD
+  [ -n "${LINK_I40E_PF_COALESCE:-}" ] && apply_ethtool_tunables "$IF" C         $LINK_I40E_PF_COALESCE
+  [ -n "${LINK_I40E_PF_PAUSE:-}"    ] && apply_ethtool_tunables "$IF" A         $LINK_I40E_PF_PAUSE
+  [ -n "${LINK_I40E_PF_RINGS:-}"    ] && apply_ethtool_tunables "$IF" G         $LINK_I40E_PF_RINGS
+  [ -n "${LINK_I40E_PF_CHANNELS:-}" ] && apply_ethtool_tunables "$IF" L         $LINK_I40E_PF_CHANNELS
+  [ -n "${LINK_I40E_PF_RSS:-}"      ] && apply_ethtool_tunables "$IF" rss       $LINK_I40E_PF_RSS
+  [ -n "${LINK_I40E_PF_NTUPLE:-}"   ] && apply_ethtool_tunables "$IF" N         $LINK_I40E_PF_NTUPLE
+
+  [ -n "${LINK_I40E_VM_QUIRK:-}" ]               && QUIRK_VLAN_BOUNCE="${LINK_I40E_VM_QUIRK}"
+  [ -n "${LINK_I40E_DERIVE_VF_MACS:-}" ]         && DERIVE_VF_MACS="${LINK_I40E_DERIVE_VF_MACS}"
+  [ -n "${LINK_I40E_SKIP_IF_VF_MAC_SET:-}" ]     && SKIP_IF_VF_MAC_SET="${LINK_I40E_SKIP_IF_VF_MAC_SET}"
+  [ -n "${LINK_I40E_ENABLE_VF_TRUE_PROMISC:-}" ] && ENABLE_VF_TRUE_PROMISC="${LINK_I40E_ENABLE_VF_TRUE_PROMISC}"
+  [ -n "${LINK_I40E_DISABLE_FW_LLDP:-}" ]        && DISABLE_FW_LLDP="${LINK_I40E_DISABLE_FW_LLDP}"
+}
+
+apply_from_props_vf() {
+  idx="$1"
+
+  vf_dev=""
+  for cand in $(vf_if_candidates "$idx"); do
+    if ip link show "$cand" >/dev/null 2>&1; then
+      vf_dev="$cand"
+      break
+    fi
+  done
+
+  eval vf_offload=\"\\${LINK_I40E_VF${idx}_OFFLOAD-}\"
+  eval vf_pause=\"\\${LINK_I40E_VF${idx}_PAUSE-}\"
+  eval vf_rings=\"\\${LINK_I40E_VF${idx}_RINGS-}\"
+  eval vf_channels=\"\\${LINK_I40E_VF${idx}_CHANNELS-}\"
+  eval vf_rss=\"\\${LINK_I40E_VF${idx}_RSS-}\"
+  eval vf_ntuple=\"\\${LINK_I40E_VF${idx}_NTUPLE-}\"
+  eval vf_mac=\"\\${LINK_I40E_VF${idx}_MAC-}\"
+  eval vf_quirk=\"\\${LINK_I40E_VF${idx}_QUIRK-}\"
+
+  if [ -n "$vf_dev" ]; then
+    [ -n "$vf_offload"  ] && apply_ethtool_tunables "$vf_dev" K   $vf_offload
+    [ -n "$vf_pause"    ] && apply_ethtool_tunables "$vf_dev" A   $vf_pause
+    [ -n "$vf_rings"    ] && apply_ethtool_tunables "$vf_dev" G   $vf_rings
+    [ -n "$vf_channels" ] && apply_ethtool_tunables "$vf_dev" L   $vf_channels
+    [ -n "$vf_rss"      ] && apply_ethtool_tunables "$vf_dev" rss $vf_rss
+    [ -n "$vf_ntuple"   ] && apply_ethtool_tunables "$vf_dev" N   $vf_ntuple
+  fi
+
+  if [ -n "$vf_quirk" ]; then
+    ensure_rxvlan_off "$IF"
+    [ -n "$vf_dev" ] && ensure_rxvlan_off "$vf_dev"
+  fi
+
+  VFRET_DEV="$vf_dev"; VFRET_MAC="$vf_mac"; VFRET_DOQUIRK="$vf_quirk"
+}
+
+# -------------------- PF-level ethtool phase --------------------------------
+load_link_props "$IF"
+apply_from_props_pf
+
+if ethtool --show-priv-flags "$IF" 2>/dev/null | grep -q 'disable-fw-lldp'; then
+  if [ "$DISABLE_FW_LLDP" = "1" ]; then
+    run_apply ethtool --set-priv-flags "$IF" disable-fw-lldp on
+  else
+    run_apply ethtool --set-priv-flags "$IF" disable-fw-lldp off
+  fi
+else
+  log_warn "priv-flag disable-fw-lldp not supported on $IF; skipping"
+fi
+
+if [ "$ENABLE_VF_TRUE_PROMISC" = "1" ]; then
+  if ethtool --show-priv-flags "$IF" 2>/dev/null | grep -q 'vf-true-promisc-support'; then
+    run_apply ethtool --set-priv-flags "$IF" vf-true-promisc-support on
+  else
+    log_warn "priv-flag vf-true-promisc-support not supported on $IF; skipping"
+  fi
+fi
+
+MAC_PREFIX=""
+if [ "$DERIVE_VF_MACS" = "1" ]; then
+  MAC_PREFIX="$(derive_mac_prefix)"
+  case "$MAC_PREFIX" in *:) : ;; *) MAC_PREFIX="";; esac
+  [ -n "$MAC_PREFIX" ] && log_info "derived VF MAC prefix from $IF: ${MAC_PREFIX}xx"
+fi
+
+# -------------------- Per-VF loop (ethtool → ip) ----------------------------
+for VF in /sys/class/net/"$IF"/device/virtfn*; do
+  [ -e "$VF" ] || continue
+  idx="$(basename "$VF" | sed 's/[^0-9]//g')"
+
+  VFRET_DEV=""; VFRET_MAC=""; VFRET_DOQUIRK=""
+  apply_from_props_vf "$idx"
+
+  if [ "$QUIRK_VLAN_BOUNCE" = "1" ]; then
+    ensure_rxvlan_off "$IF"
+    if [ -z "$VFRET_DEV" ]; then
+      for c in $(vf_if_candidates "$idx"); do
+        if ip link show "$c" >/dev/null 2>&1; then VFRET_DEV="$c"; break; fi
+      done
+    fi
+    [ -n "$VFRET_DEV" ] && ensure_rxvlan_off "$VFRET_DEV"
+  fi
+
+  apply_ip_tunables "$IF" "$idx" spoofchk off
+  apply_ip_tunables "$IF" "$idx" trust on
+
+  if [ -n "$VFRET_MAC" ] && is_hex_mac "$VFRET_MAC"; then
+    setmac="$(sanitize_llaa_unicast "$VFRET_MAC")"
+    apply_ip_tunables "$IF" "$idx" mac "$setmac"
+    log_info "VF $idx: explicit admin MAC $setmac"
+  fi
+
+  if [ "$DERIVE_VF_MACS" = "1" ] && [ -n "$MAC_PREFIX" ]; then
+    do_set=1
+    if [ "$SKIP_IF_VF_MAC_SET" = "1" ]; then
+      cur="$(get_vf_admin_mac "$idx" || true)"
+      if is_hex_mac "$cur"; then do_set=0; log_info "VF $idx: keep existing admin MAC ($cur)"; fi
+    fi
+    if [ "$do_set" -eq 1 ]; then
+      last="$(printf '%02x' "$idx")"
+      newmac="$(sanitize_llaa_unicast "${MAC_PREFIX}${last}")"
+      apply_ip_tunables "$IF" "$idx" mac "$newmac"
+      log_info "VF $idx: set derived MAC $newmac"
+    fi
+  fi
+
+  if [ -n "$VFRET_DOQUIRK" ] || [ "$QUIRK_VLAN_BOUNCE" = "1" ]; then
+    apply_ip_tunables "$IF" "$idx" vlan 10
+    apply_ip_tunables "$IF" "$idx" vlan 0
+  fi
+done
+
+log_info "postlink completed on $IF"
