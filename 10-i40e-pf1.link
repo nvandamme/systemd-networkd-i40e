@@ -2,11 +2,11 @@
 Path=pci-0000:02:00.0
 
 [Link]
-Name=enp2s0f0np0
-Description=PF0 (WAN)
+Name=enp2s0f1np1
+Description=PF1 (LAN)
 
 # Native systemd SR-IOV Virtual function handler (1 VF per lxc/vm for example)
-SR-IOVVirtualFunctions=1
+SR-IOVVirtualFunctions=4
 
 # Native systemd-networkd tunnables
 TransmitQueueLength=10000
@@ -19,13 +19,12 @@ RxCoalesceSec=0
 
 # General toggles to pass to i40e-postlink service
 Property=I40E_DISABLE_FW_LLDP=1
-Property=I40E_ENABLE_VF_TRUE_PROMISC=1 # specific to port 0 for X710-DA2 intel network card
 Property=I40E_DERIVE_VF_MACS=1
 Property=I40E_SKIP_IF_VF_MAC_SET=1
 Property=I40E_VLAN_QUIRK=1
 Property=I40E_ASYM_QUIRK=1
 
-# Specific ethtool/ip toggles to pass to i40e-postlink service (use systemd one first for clarity)
+# Specific PF ethtool/ip toggles to pass to i40e-postlink service  (use systemd one first for clarity)
 #Property=I40E_PF_OFFLOAD=rxvlan off gro off gso off
 #Property=I40E_PF_COALESCE=rx-usecs 0 tx-usecs 0
 #Property=I40E_PF_RINGS=rx 4096 tx 4096
@@ -46,3 +45,21 @@ MACSpoofCheck=false
 LinkState=enable
 # Specific VF ethtool/ip toggles to pass to i40e-postlink service (overrides global ones above)
 #Property=I40E_VF0_OFFLOAD=gro off gso off
+
+[SR-IOV]
+VirtualFunction=1
+Trust=true
+MACSpoofCheck=false
+LinkState=enable
+
+[SR-IOV]
+VirtualFunction=2
+Trust=true
+MACSpoofCheck=false
+LinkState=enable
+
+[SR-IOV]
+VirtualFunction=3
+Trust=true
+MACSpoofCheck=false
+LinkState=enable
