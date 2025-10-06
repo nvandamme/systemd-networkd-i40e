@@ -54,21 +54,6 @@ sudo systemctl enable --now i40e-postlink@enp2s0f0np0.service
 sudo systemctl enable --now i40e-postlink@enp2s0f1np1.service
 ```
 
-## Supported PF and VF ip link tunables
-
-The script supports all major `ip link` tunables for PF and VF, including:
-
-- **PF-level:** `txqueuelen`, `mtu`, `alias`, `arp`, `multicast`, `allmulticast`, `promisc`, `mac` (address)
-- **VF-level (to VF netdev):** `txqueuelen`, `mtu`, `alias`, `arp`, `multicast`, `allmulticast`, `promisc`, `mac` (address)
-- **VF subcommands (via PF handle):** `mac`, `vlan`, `rate`, `spoofchk`, `state`, `query_rss`, `trust`, `max_tx_rate`, `min_tx_rate`, `rss`
-
-Set these via environment variables or `.link` properties, e.g.:
-
-- `I40E_PF_TXQUEUELEN=10000`
-- `I40E_VF_MTU=9000`
-- `I40E_VF3_PROMISC=on`
-- `I40E_VF2_VLAN=10`
-
 ## Environment defaults (can be overridden via `.link` Properties or preset as env vars)
 
 - `DERIVE_VF_MACS`           → derive VF MACs from PF MAC + VF index, default **on**
@@ -93,7 +78,7 @@ Set these via environment variables or `.link` properties, e.g.:
 DRY_RUN=1 I40E_PF_OFFLOAD="gro off" /usr/local/sbin/i40e-postlink enp2s0f0np0
 # Output:
 # DRY_RUN: Listing preset I40E_* environment variables:
-# DRY_RUN: I40E_PF_OFFLOAD=gro off
+# DRY_RUN: I40E_PF_OFFLOAD="gro off"
 # DRY: ethtool -K enp2s0f0np0 gro off
 ...
 ```
@@ -102,6 +87,10 @@ DRY_RUN=1 I40E_PF_OFFLOAD="gro off" /usr/local/sbin/i40e-postlink enp2s0f0np0
 
 > [!WARNING]
 > **Do not** include `-K/-C/-A/...` switches in property values; the script maps each property to the right ethtool family and applies the whole set **in one operation**.
+
+> [!CRITICAL]
+> All properties must be quoted if they contain spaces, e.g.:
+> `Property=I40E_PF_OFFLOAD="rxvlan off tx-checksum-ip-generic off"`
 
 ### PF-level properties
 

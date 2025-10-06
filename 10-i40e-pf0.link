@@ -26,17 +26,17 @@ Property=I40E_VLAN_QUIRK=1
 Property=I40E_ASYM_QUIRK=1
 
 # Specific ethtool/ip toggles to pass to i40e-postlink service (use systemd one first for clarity)
-#Property=I40E_PF_OFFLOAD=rxvlan off gro off gso off
-#Property=I40E_PF_COALESCE=rx-usecs 0 tx-usecs 0
-#Property=I40E_PF_RINGS=rx 4096 tx 4096
-#Property=I40E_PF_CHANNELS=combined 16
-#Property=I40E_PF_RSS=hfunc toeplitz
-#Property=I40E_PF_NTUPLE=rx-flow-hash tcp4 sdfn
+#Property=I40E_PF_OFFLOAD="rxvlan off gro off gso off"
+#Property=I40E_PF_COALESCE="rx-usecs 0 tx-usecs 0"
+#Property=I40E_PF_RINGS="rx 4096 tx 4096"
+#Property=I40E_PF_CHANNELS="combined 16"
+#Property=I40E_PF_RSS="hfunc toeplitz"
+#Property=I40E_PF_NTUPLE="rx-flow-hash tcp4 sdfn"
 
 # global VF toggles to pass to i40e-postlink service (can be overridden)
 Property=I40E_VF_TXQUEUELEN=1000
-Property=I40E_VF_RINGS=rx 4096 tx 4096
-Property=I40E_VF_CHANNELS=combined 4
+Property=I40E_VF_RINGS="rx 4096 tx 4096"
+Property=I40E_VF_CHANNELS="combined 4"
 
 # per VF defs
 [SR-IOV]
@@ -45,4 +45,4 @@ Trust=true
 MACSpoofCheck=false
 LinkState=enable
 # Specific VF ethtool/ip toggles to pass to i40e-postlink service (overrides global ones above)
-#Property=I40E_VF0_OFFLOAD=gro off gso off
+#Property=I40E_VF0_OFFLOAD="gro off gso off"
