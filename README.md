@@ -88,7 +88,7 @@ DRY_RUN=1 I40E_PF_OFFLOAD="gro off" /usr/local/sbin/i40e-postlink enp2s0f0np0
 > [!WARNING]
 > **Do not** include `-K/-C/-A/...` switches in property values; the script maps each property to the right ethtool family and applies the whole set **in one operation**.
 
-> [!CRITICAL]
+> [!CAUTION]
 > All properties must be quoted if they contain spaces, e.g.:
 > `Property=I40E_PF_OFFLOAD="rxvlan off tx-checksum-ip-generic off"`
 
