@@ -42,7 +42,7 @@ Property=I40E_VF_CHANNELS="combined 4"
 VirtualFunction=0
 Trust=true
 MACSpoofCheck=false
-LinkState=enable
+LinkState=yes
 # Specific VF ethtool/ip toggles to pass to i40e-postlink service (overrides global ones above)
 #Property=I40E_VF0_OFFLOAD="gro off gso off"
 
@@ -50,16 +50,16 @@ LinkState=enable
 VirtualFunction=1
 Trust=true
 MACSpoofCheck=false
-LinkState=enable
+LinkState=yes
 
 [SR-IOV]
 VirtualFunction=2
 Trust=true
 MACSpoofCheck=false
-LinkState=enable
+LinkState=yes
 
 [SR-IOV]
 VirtualFunction=3
 Trust=true
 MACSpoofCheck=false
-LinkState=enable
+LinkState=yes
