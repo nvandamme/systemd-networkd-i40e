@@ -92,12 +92,12 @@ sanitize_llaa_unicast(){
 
 derive_mac_prefix(){
   pfmac="$(cat "/sys/class/net/$IF/address" 2>/dev/null || echo 00:00:00:00:00:00)"
-  pfunc="$(pf_func_id)"
-  printf '%s\n' "$pfmac" | awk -v pfunc="$pfunc" -F: '
+  pfid="$(pf_func_id)"
+  printf '%s\n' "$pfmac" | awk -v pfid="$pfid" -F: '
     function H(n){return sprintf("%02x",n)}
     { for(i=1;i<=6;i++){o[i]=strtonum("0x"$i)}
       o[1]=and(or(o[1],2),254)               # set LAA, clear multicast
-      o[5]=or(and(o[5],240),and(pfunc,15))   # embed PF function nibble
+      o[5]=or(and(o[5],240),and(pfid,15))   # embed PF function nibble
       printf "%s:%s:%s:%s:%s:",H(o[1]),H(o[2]),H(o[3]),H(o[4]),H(o[5])
     }'
 }
