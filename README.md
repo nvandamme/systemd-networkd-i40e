@@ -206,7 +206,7 @@ journalctl -t i40e-postlink -b
 
 ```bash
 ethtool --show-priv-flags enp2s0f0np0
-ethtool -k enp2s0f0np0 | egrep 'rxvlan|tx-checksum|tx-checksum-(ip|ipv|sctp)'
+ethtool -k enp2s0f0np0 | egrep 'rx-vlan|tx-checksum|tx-checksum-(ip|ipv|sctp)'
 ip -d link show enp2s0f0np0
 ```
 
