@@ -1,14 +1,36 @@
 [Unit]
 Description=Intel X710 post-link tweaks for %I
 After=systemd-udevd.service
+# Run after udev applied the .link and created VFs
 Wants=systemd-udevd.service
 
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 ExecStart=/usr/local/sbin/i40e-postlink %I
+# keep boot resilient:
 TimeoutStartSec=30s
 Nice=10
 IOSchedulingClass=idle
+# Make sure we can talk to netlink/sysfs and run ethtool/ip
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+PrivateNetwork=no
+ProtectSystem=strict
+ReadWritePaths=/sys
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+# Force all output into the journal even on early failure
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=i40e-postlink
 
 [Install]
 WantedBy=multi-user.target

@@ -14,7 +14,7 @@ The service runs **once per PF** (e.g., `enp2s0f0np0`) and:
 5. Implements **quirks** for per VF VLAN stripping and host-path asymmetry.
 6. **DRY_RUN mode:** If `DRY_RUN=1` is set, the script logs all commands it would run, without making changes. It also logs all preset `I40E_*` environment variables.
 
-> The helper **logs every command** (success and failure) via `logger -t i40e-postlink -p kern.*`.
+> The helper **logs every command** (success and failure) to stderr with systemd log-level prefixes (`<6>` info, `<4>` warning). Under systemd, output is captured via the unit's stdio pipe for reliable journal attribution; the `SyslogIdentifier=i40e-postlink` directive sets the journal tag. When run standalone, output goes to the terminal.
 
 ## Contents
 
@@ -29,7 +29,7 @@ The service runs **once per PF** (e.g., `enp2s0f0np0`) and:
 ### Requirements
 
 - Kernel drivers: `i40e` (PF), `iavf` (VF).
-- Tools: `iproute2`, `ethtool`, `systemd-udev`, `systemd-networkd`, `logger`.
+- Tools: `iproute2`, `ethtool`, `systemd-udev`, `systemd-networkd`.
 - SR-IOV enabled in BIOS and available on the NIC.
 - VFs created either via .link SR-IOV* keys or by other means (udev rules, sysfs echo, etc.) before the service runs.
 
@@ -126,9 +126,12 @@ DRY_RUN=1 I40E_PF_OFFLOAD="gro off" /usr/local/sbin/i40e-postlink enp2s0f0np0
 
 ### Per-VF properties (index `N`)
 
+> **Global VF fallbacks:** every per-VF property `I40E_VF<N>_<KEY>` has a corresponding global form `I40E_VF_<KEY>` (e.g. `I40E_VF_OFFLOAD`, `I40E_VF_COALESCE`, `I40E_VF_TXQUEUELEN`) that is applied to **all** VFs unless overridden by the per-VF variant. VF subcommands via the PF handle (`SPOOFCHK`, `TRUST`, `RATE`, etc.) also have global fallbacks.
+
 | Property key pattern                 | Maps to                      | Example |
 |-------------------------------------|------------------------------|---------|
 | `I40E_VF<N>_OFFLOAD`                | `ethtool -K <VF>`            | `rxvlan off` |
+| `I40E_VF<N>_COALESCE`               | `ethtool -C <VF>`            | `rx-usecs 0 tx-usecs 0` |
 | `I40E_VF<N>_PAUSE`                  | `ethtool -A <VF>`            | `rx off tx off` |
 | `I40E_VF<N>_RINGS`                  | `ethtool -G <VF>`            | `rx 1024 tx 1024` |
 | `I40E_VF<N>_CHANNELS`               | `ethtool -L <VF>`            | `combined 2` |
@@ -157,7 +160,10 @@ DRY_RUN=1 I40E_PF_OFFLOAD="gro off" /usr/local/sbin/i40e-postlink enp2s0f0np0
 | `I40E_VF<N>_TRUST`               | `ip link set dev <PF> vf N trust`       | `on`/`off` |
 | `I40E_VF<N>_MAX_TX_RATE`         | `ip link set dev <PF> vf N max_tx_rate` | `10000` |
 | `I40E_VF<N>_MIN_TX_RATE`         | `ip link set dev <PF> vf N min_tx_rate` | `1000` |
-| `I40E_VF<N>_RSS`                 | `ip link set dev <PF> vf N rss`         | `on`/`off` |
+
+> **`query_rss` auto-enable:** when ethtool RSS tunables are set (`I40E_VF<N>_RSS` or `I40E_VF_RSS`) but no explicit `I40E_VF<N>_QUERY_RSS` is provided, `query_rss on` is issued automatically via the PF handle.
+>
+> **`query_rss` value normalization:** `1`/`true`/`yes`/`on` → `on`; `0`/`false`/`no`/`off` → `off`.
 
 ---
 
@@ -199,7 +205,7 @@ DRY_RUN=1 I40E_PF_OFFLOAD="gro off" /usr/local/sbin/i40e-postlink enp2s0f0np0
 ### Logs
 
 ```bash
-journalctl -t i40e-postlink -b
+journalctl -u i40e-postlink@enp2s0f0np0.service -b
 ```
 
 ### Verify
@@ -214,7 +220,7 @@ ip -d link show enp2s0f0np0
 
 - A property uses a switch (e.g., `-K`) — **remove the switch**; give only the arguments.
 - A flag isn’t supported on your FW/kernel — the script logs a **WARNING** and continues.
-- VF netdev name not yet present — per-VF **ethtool** might be skipped; IP ops still run on the PF’s VF handle.
+- VF netdev name not yet present — per-VF **ethtool** and VF-netdev ip tunables are skipped (a **warning** is logged); PF-handle VF subcommands (`spoofchk`, `trust`, `vlan`, `rate`, `state`, `query_rss`, `max_tx_rate`, `min_tx_rate`) still run because they operate via `ip link set dev <PF> vf N ...`.
 - In DRY_RUN mode, no changes are made; only logs are produced.
 
 ---

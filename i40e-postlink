@@ -20,8 +20,11 @@
 set -u
 
 # ---------- logging ----------
-log_info(){ command -v logger >/dev/null 2>&1 && logger -t i40e-postlink -p kern.info -- "$*" || printf 'i40e-postlink[info]: %s\n' "$*" >&2; }
-log_warn(){ command -v logger >/dev/null 2>&1 && logger -t i40e-postlink -p kern.warning -- "$*" || printf 'i40e-postlink[warn]: %s\n' "$*" >&2; }
+# Use stderr with systemd log-level prefixes (<6>=info, <4>=warning).
+# Under systemd, stderr is captured via pipe — zero message loss.
+# Standalone, the <N> prefix is harmless and the tag is in the text.
+log_info(){ printf '<6>i40e-postlink: %s\n' "$*" >&2; }
+log_warn(){ printf '<4>i40e-postlink: %s\n' "$*" >&2; }
 trap 'rc=$?; [ "$rc" -ne 0 ] && log_warn "unexpected non-zero exit rc=$rc"; exit "$rc"' EXIT
 
 # Mutating runner: always log, never abort
@@ -269,7 +272,7 @@ apply_from_props_vf(){
   idx="$1"
 
   vf_dev=""
-  vf_offload=""; vf_pause=""; vf_rings=""; vf_channels=""; vf_rss=""; vf_ntuple=""
+  vf_offload=""; vf_coalesce=""; vf_pause=""; vf_rings=""; vf_channels=""; vf_rss=""; vf_ntuple=""
   vf_mac=""
   vf_q_vlan=""; vf_q_asym=""
 
@@ -282,6 +285,7 @@ apply_from_props_vf(){
 
   # Per-VF properties
   eval 'vf_offload=${I40E_VF'"$idx"'_OFFLOAD-}'
+  eval 'vf_coalesce=${I40E_VF'"$idx"'_COALESCE-}'
   eval 'vf_pause=${I40E_VF'"$idx"'_PAUSE-}'
   eval 'vf_rings=${I40E_VF'"$idx"'_RINGS-}'
   eval 'vf_channels=${I40E_VF'"$idx"'_CHANNELS-}'
@@ -298,6 +302,7 @@ apply_from_props_vf(){
 
   # Global VF properties (applied to all VFs unless overridden)
   [ -z "$vf_offload"  ] && vf_offload="${I40E_VF_OFFLOAD:-}"
+  [ -z "$vf_coalesce" ] && vf_coalesce="${I40E_VF_COALESCE:-}"
   [ -z "$vf_pause"    ] && vf_pause="${I40E_VF_PAUSE:-}"
   [ -z "$vf_rings"    ] && vf_rings="${I40E_VF_RINGS:-}"
   [ -z "$vf_channels" ] && vf_channels="${I40E_VF_CHANNELS:-}"
@@ -307,11 +312,14 @@ apply_from_props_vf(){
 
   if [ -n "$vf_dev" ]; then
     [ -n "$vf_offload"  ] && apply_ethtool_tunables "$vf_dev" K   "$vf_offload"
+    [ -n "$vf_coalesce" ] && apply_ethtool_tunables "$vf_dev" C   "$vf_coalesce"
     [ -n "$vf_pause"    ] && apply_ethtool_tunables "$vf_dev" A   "$vf_pause"
     [ -n "$vf_rings"    ] && apply_ethtool_tunables "$vf_dev" G   "$vf_rings"
     [ -n "$vf_channels" ] && apply_ethtool_tunables "$vf_dev" L   "$vf_channels"
     [ -n "$vf_rss"      ] && apply_ethtool_tunables "$vf_dev" rss "$vf_rss"
     [ -n "$vf_ntuple"   ] && apply_ethtool_tunables "$vf_dev" N   "$vf_ntuple"
+  else
+    log_warn "VF $idx: no host-side netdev found; skipping VF-netdev ethtool/ip tunables"
   fi
 
   # --- VF subcommands (via PF handle) ---
@@ -323,7 +331,6 @@ apply_from_props_vf(){
   eval 'vf_ip_trust=${I40E_VF'"$idx"'_TRUST-}'
   eval 'vf_ip_max_tx_rate=${I40E_VF'"$idx"'_MAX_TX_RATE-}'
   eval 'vf_ip_min_tx_rate=${I40E_VF'"$idx"'_MIN_TX_RATE-}'
-  eval 'vf_ip_rss=${I40E_VF'"$idx"'_RSS-}'
 
   # Global fallback for each subcommand
   [ -z "$vf_ip_rate" ]        && vf_ip_rate="${I40E_VF_RATE:-}"
@@ -333,19 +340,26 @@ apply_from_props_vf(){
   [ -z "$vf_ip_trust" ]       && vf_ip_trust="${I40E_VF_TRUST:-}"
   [ -z "$vf_ip_max_tx_rate" ] && vf_ip_max_tx_rate="${I40E_VF_MAX_TX_RATE:-}"
   [ -z "$vf_ip_min_tx_rate" ] && vf_ip_min_tx_rate="${I40E_VF_MIN_TX_RATE:-}"
-  [ -z "$vf_ip_rss" ]         && vf_ip_rss="${I40E_VF_RSS:-}"
 
-  # Apply subcommands via PF handle
-  if [ -n "$vf_dev" ]; then
-    [ -n "$vf_ip_vlan"        ] && apply_ip_tunables "$IF" "$idx" vlan "$vf_ip_vlan"
-    [ -n "$vf_ip_rate"        ] && apply_ip_tunables "$IF" "$idx" rate "$vf_ip_rate"
-    [ -n "$vf_ip_spoofchk"    ] && apply_ip_tunables "$IF" "$idx" spoofchk "$vf_ip_spoofchk"
-    [ -n "$vf_ip_state"       ] && apply_ip_tunables "$IF" "$idx" state "$vf_ip_state"
-    [ -n "$vf_ip_query_rss"   ] && apply_ip_tunables "$IF" "$idx" query_rss "$vf_ip_query_rss"
-    [ -n "$vf_ip_trust"       ] && apply_ip_tunables "$IF" "$idx" trust "$vf_ip_trust"
-    [ -n "$vf_ip_max_tx_rate" ] && apply_ip_tunables "$IF" "$idx" max_tx_rate "$vf_ip_max_tx_rate"
-    [ -n "$vf_ip_min_tx_rate" ] && apply_ip_tunables "$IF" "$idx" min_tx_rate "$vf_ip_min_tx_rate"
-    [ -n "$vf_ip_rss"         ] && apply_ip_tunables "$IF" "$idx" rss "$vf_ip_rss"
+  # Apply subcommands via PF handle (no vf_dev gate: these operate on the PF)
+  [ -n "$vf_ip_vlan"        ] && apply_ip_tunables "$IF" "$idx" vlan "$vf_ip_vlan"
+  [ -n "$vf_ip_rate"        ] && apply_ip_tunables "$IF" "$idx" rate "$vf_ip_rate"
+  [ -n "$vf_ip_spoofchk"    ] && apply_ip_tunables "$IF" "$idx" spoofchk "$vf_ip_spoofchk"
+  [ -n "$vf_ip_state"       ] && apply_ip_tunables "$IF" "$idx" state "$vf_ip_state"
+  [ -n "$vf_ip_query_rss"   ] && {
+    case "$vf_ip_query_rss" in
+      1|true|yes|on)  apply_ip_tunables "$IF" "$idx" query_rss on ;;
+      0|false|no|off) apply_ip_tunables "$IF" "$idx" query_rss off ;;
+      *) apply_ip_tunables "$IF" "$idx" query_rss "$vf_ip_query_rss" ;;
+    esac
+  }
+  [ -n "$vf_ip_trust"       ] && apply_ip_tunables "$IF" "$idx" trust "$vf_ip_trust"
+  [ -n "$vf_ip_max_tx_rate" ] && apply_ip_tunables "$IF" "$idx" max_tx_rate "$vf_ip_max_tx_rate"
+  [ -n "$vf_ip_min_tx_rate" ] && apply_ip_tunables "$IF" "$idx" min_tx_rate "$vf_ip_min_tx_rate"
+
+  # Auto-enable query_rss when ethtool RSS tunables are set but user didn't set it explicitly
+  if [ -z "$vf_ip_query_rss" ] && [ -n "$vf_rss" ]; then
+    apply_ip_tunables "$IF" "$idx" query_rss on
   fi
 
   # --- Per-VF IP-level tunables ---
@@ -358,7 +372,6 @@ apply_from_props_vf(){
   eval 'vf_ip_promisc=${I40E_VF'"$idx"'_PROMISC-}'
   eval 'vf_ip_mac=${I40E_VF'"$idx"'_MAC-}'
   #eval 'vf_ip_name=${I40E_VF'"$idx"'_NAME-}' # dangerous; not supported in post-link
-  eval 'vf_ip_mtu=${I40E_VF'"$idx"'_MTU-}'
 
   # Global VF IP-level tunables (applied to all VFs unless overridden)
   [ -z "$vf_ip_txqueuelen" ]   && vf_ip_txqueuelen="${I40E_VF_TXQUEUELEN:-}"
@@ -367,9 +380,8 @@ apply_from_props_vf(){
   [ -z "$vf_ip_multicast" ]    && vf_ip_multicast="${I40E_VF_MULTICAST:-}"
   [ -z "$vf_ip_allmulticast" ] && vf_ip_allmulticast="${I40E_VF_ALLMULTICAST:-}"
   [ -z "$vf_ip_promisc" ]      && vf_ip_promisc="${I40E_VF_PROMISC:-}"
-  [ -z "$vf_ip_mtu" ]         && vf_ip_mtu="${I40E_VF_MTU:-}"
 
-  # Apply ethtool tunables to VF netdev
+  # Apply ip tunables to VF netdev
   if [ -n "$vf_dev" ]; then
     [ -n "$vf_ip_txqueuelen" ]   && apply_ip_tunables "$vf_dev" txqueuelen "$vf_ip_txqueuelen"
     [ -n "$vf_ip_mtu" ]          && apply_ip_tunables "$vf_dev" mtu "$vf_ip_mtu"
@@ -379,7 +391,6 @@ apply_from_props_vf(){
     [ -n "$vf_ip_allmulticast" ] && apply_ip_tunables "$vf_dev" allmulticast "$vf_ip_allmulticast"
     [ -n "$vf_ip_promisc" ]      && apply_ip_tunables "$vf_dev" promisc "$vf_ip_promisc"
     #[ -n "$vf_ip_name" ]         && apply_ip_tunables "$vf_dev" name "$vf_ip_name" # dangerous; not supported in post-link
-    [ -n "$vf_ip_mtu" ]          && apply_ip_tunables "$vf_dev" mtu "$vf_ip_mtu"
   fi
 
   VFRET_DEV="$vf_dev"
