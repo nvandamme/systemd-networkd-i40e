@@ -44,7 +44,102 @@ run_apply(){
 }
 
 # ---------- argv / defaults ----------
-IF="${1:-}"; [ -n "$IF" ] || { echo "usage: $0 <pf-ifname>" >&2; exit 2; }
+usage(){
+  cat <<EOF
+usage: $0 [options] <pf-ifname>
+
+Options:
+  --interface <pf-ifname>           PF interface name as an explicit switch
+  --dry-run | --no-dry-run         Enable or disable dry-run mode
+  --derive-vf-macs | --no-derive-vf-macs
+  --skip-if-vf-mac-set | --no-skip-if-vf-mac-set
+  --enable-vf-true-promisc | --no-enable-vf-true-promisc
+  --disable-fw-lldp | --no-disable-fw-lldp
+  --asym-quirk | --no-asym-quirk
+  --vlan-quirk | --no-vlan-quirk
+  -h, --help                       Show this help text
+
+Precedence: CLI switches > environment variables > .link Property=I40E_* > built-in defaults.
+EOF
+}
+
+CLI_UNSET='__unset__'
+CLI_DRY_RUN=$CLI_UNSET
+CLI_DERIVE_VF_MACS=$CLI_UNSET
+CLI_SKIP_IF_VF_MAC_SET=$CLI_UNSET
+CLI_ENABLE_VF_TRUE_PROMISC=$CLI_UNSET
+CLI_DISABLE_FW_LLDP=$CLI_UNSET
+CLI_ASYM_QUIRK=$CLI_UNSET
+CLI_VLAN_QUIRK=$CLI_UNSET
+SYS_CLASS_NET_ROOT=${I40E_SYS_CLASS_NET_ROOT:-/sys/class/net}
+
+parse_args(){
+  IF=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --interface)
+        shift
+        [ $# -gt 0 ] || { echo "missing value for --interface" >&2; exit 2; }
+        [ -z "$IF" ] || { echo "interface already set: $IF" >&2; exit 2; }
+        IF=$1
+        ;;
+      --dry-run) CLI_DRY_RUN=1 ;;
+      --no-dry-run) CLI_DRY_RUN=0 ;;
+      --derive-vf-macs) CLI_DERIVE_VF_MACS=1 ;;
+      --no-derive-vf-macs) CLI_DERIVE_VF_MACS=0 ;;
+      --skip-if-vf-mac-set) CLI_SKIP_IF_VF_MAC_SET=1 ;;
+      --no-skip-if-vf-mac-set) CLI_SKIP_IF_VF_MAC_SET=0 ;;
+      --enable-vf-true-promisc) CLI_ENABLE_VF_TRUE_PROMISC=1 ;;
+      --no-enable-vf-true-promisc) CLI_ENABLE_VF_TRUE_PROMISC=0 ;;
+      --disable-fw-lldp) CLI_DISABLE_FW_LLDP=1 ;;
+      --no-disable-fw-lldp) CLI_DISABLE_FW_LLDP=0 ;;
+      --asym-quirk) CLI_ASYM_QUIRK=1 ;;
+      --no-asym-quirk) CLI_ASYM_QUIRK=0 ;;
+      --vlan-quirk) CLI_VLAN_QUIRK=1 ;;
+      --no-vlan-quirk) CLI_VLAN_QUIRK=0 ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        echo "unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+      *)
+        [ -z "$IF" ] || { echo "unexpected argument: $1" >&2; exit 2; }
+        IF=$1
+        ;;
+    esac
+    shift
+  done
+
+  while [ $# -gt 0 ]; do
+    [ -z "$IF" ] || { echo "unexpected argument: $1" >&2; exit 2; }
+    IF=$1
+    shift
+  done
+
+  [ -n "$IF" ] || { usage >&2; exit 2; }
+}
+
+apply_cli_overrides(){
+  [ "$CLI_DERIVE_VF_MACS" != "$CLI_UNSET" ] && DERIVE_VF_MACS=$CLI_DERIVE_VF_MACS
+  [ "$CLI_SKIP_IF_VF_MAC_SET" != "$CLI_UNSET" ] && SKIP_IF_VF_MAC_SET=$CLI_SKIP_IF_VF_MAC_SET
+  [ "$CLI_ENABLE_VF_TRUE_PROMISC" != "$CLI_UNSET" ] && ENABLE_VF_TRUE_PROMISC=$CLI_ENABLE_VF_TRUE_PROMISC
+  [ "$CLI_DISABLE_FW_LLDP" != "$CLI_UNSET" ] && DISABLE_FW_LLDP=$CLI_DISABLE_FW_LLDP
+  [ "$CLI_ASYM_QUIRK" != "$CLI_UNSET" ] && ASYM_QUIRK=$CLI_ASYM_QUIRK
+  [ "$CLI_VLAN_QUIRK" != "$CLI_UNSET" ] && VLAN_QUIRK=$CLI_VLAN_QUIRK
+}
+
+parse_args "$@"
+
+DRY_RUN=${DRY_RUN:-0}
+[ "$CLI_DRY_RUN" != "$CLI_UNSET" ] && DRY_RUN=$CLI_DRY_RUN
 
 DERIVE_VF_MACS=${DERIVE_VF_MACS:-1}
 SKIP_IF_VF_MAC_SET=${SKIP_IF_VF_MAC_SET:-1}
@@ -79,7 +174,7 @@ is_hex_mac() {
 }
 
 pf_func_id(){
-  devpath="$(readlink -f "/sys/class/net/$IF/device" 2>/dev/null || true)"
+  devpath="$(readlink -f "$SYS_CLASS_NET_ROOT/$IF/device" 2>/dev/null || true)"
   [ -n "$devpath" ] || { echo 0; return; }
   printf '%s\n' "${devpath##*.}"
 }
@@ -94,7 +189,7 @@ sanitize_llaa_unicast(){
 }
 
 derive_mac_prefix(){
-  pfmac="$(cat "/sys/class/net/$IF/address" 2>/dev/null || echo 00:00:00:00:00:00)"
+  pfmac="$(cat "$SYS_CLASS_NET_ROOT/$IF/address" 2>/dev/null || echo 00:00:00:00:00:00)"
   pfid="$(pf_func_id)"
   printf '%s\n' "$pfmac" | awk -v pfid="$pfid" -F: '
     function H(n){return sprintf("%02x",n)}
@@ -109,7 +204,7 @@ vf_if_candidates(){ printf '%sv%s\n' "$IF" "$1"; printf '%sv%s\n' "${IF%np*}" "$
 
 get_vf_admin_mac(){
   ip -d link show "$IF" 2>/dev/null |
-  awk -v vidx="$1" '$1=="vf" && $2==vidx":" { for (i=1;i<NF;i++) if ($i=="MAC") { print $(i+1); exit } }'
+  awk -v vidx="$1" '$1=="vf" && $2==vidx":" { for (i=1;i<NF;i++) if ($i=="MAC") { mac=$(i+1); sub(/[,:]$/, "", mac); print mac; exit } }'
 }
 
 ensure_rxvlan_off(){
@@ -206,7 +301,7 @@ apply_ip_tunables(){
 # ---------- read I40E_* from .link ----------
 load_link_props(){
   ifname=$1
-  props="$(udevadm info -q property -p "/sys/class/net/$ifname" 2>/dev/null || true)"
+  props="$(udevadm info -q property -p "$SYS_CLASS_NET_ROOT/$ifname" 2>/dev/null || true)"
   tmpfile=$(mktemp -t i40e.props.XXXXXX) || exit 1
   printf '%s\n' "$props" >"$tmpfile"
   while IFS= read -r line; do
@@ -407,12 +502,13 @@ load_link_props "$IF"
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
   log_info "DRY_RUN: Listing preset I40E_* environment variables:"
-  env | grep '^I40E_' | while IFS= read -r line; do
+  env | grep '^I40E_' | LC_ALL=C sort | while IFS= read -r line; do
     log_info "DRY_RUN: $line"
   done
 fi
 
 apply_from_props_pf
+apply_cli_overrides
 
 # Baseline priv-flags
 if ethtool --show-priv-flags "$IF" 2>/dev/null | grep -q 'disable-fw-lldp'; then
@@ -450,7 +546,7 @@ if [ "$DERIVE_VF_MACS" = "1" ]; then
 fi
 
 # ---------- Per-VF loop (ethtool → ip) ----------
-for VF in /sys/class/net/"$IF"/device/virtfn*; do
+for VF in "$SYS_CLASS_NET_ROOT"/"$IF"/device/virtfn*; do
   [ -e "$VF" ] || continue
   idx="$(basename "$VF" | sed 's/[^0-9]//g')"
 

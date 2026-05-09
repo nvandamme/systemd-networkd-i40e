@@ -1,0 +1,11 @@
+[package]
+name = "i40e-postlink"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Intel X710/i40e SR-IOV post-link helper for systemd-networkd"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
